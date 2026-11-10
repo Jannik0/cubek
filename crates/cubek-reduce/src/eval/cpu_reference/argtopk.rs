@@ -40,7 +40,16 @@ pub fn reference_argtopk(
             coord[axis] = i;
             pairs.push((input.get_f32(&coord), i as u32));
         }
-        pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // NaN first, then the largest, then the lower index: the kernels' `TopK` order.
+        pairs.sort_by(|a, b| {
+            let by_value = match (a.0.is_nan(), b.0.is_nan()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal),
+            };
+            by_value.then(a.1.cmp(&b.1))
+        });
 
         for i in 0..k {
             coord[axis] = i;

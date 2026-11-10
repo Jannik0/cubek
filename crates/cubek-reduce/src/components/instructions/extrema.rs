@@ -7,7 +7,7 @@ use cubecl::{
 // `E: Numeric` can't call the float-only `IsNan` trait even after a comptime type check, so emit
 // the same Cube IR operation directly. Callers keep this inside float-only comptime branches.
 #[cube]
-fn numeric_is_nan<E: Numeric, N: Size>(item: Vector<E, N>) -> Vector<bool, N> {
+pub(crate) fn numeric_is_nan<E: Numeric, N: Size>(item: Vector<E, N>) -> Vector<bool, N> {
     intrinsic!(|scope| {
         let item = item.read_value(scope);
         let out_item = Type::Scalar(ElemType::Bool).with_vector_size(item.vector_size(scope.ctx()));
@@ -25,6 +25,13 @@ pub(crate) fn max_identity<E: Numeric>() -> E {
     } else {
         E::min_value()
     }
+}
+
+/// A quiet NaN of `E`, for a float `E`.
+#[cube]
+pub(crate) fn nan_value<E: Numeric>() -> E {
+    // WGSL has no NaN literal either, so construct it from its IEEE-754 bits.
+    E::cast_from(f32::reinterpret(0x7fc0_0000u32))
 }
 
 #[cube]

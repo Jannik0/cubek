@@ -1,5 +1,5 @@
 use crate::components::{
-    instructions::{lowest_coordinate_matching, max_identity},
+    instructions::{max_identity, nan_value, numeric_is_nan},
     precision::ReducePrecision,
 };
 use cubecl::prelude::*;
@@ -194,6 +194,216 @@ pub(crate) fn reaches<N: Numeric, S: Size>(item: Vector<N, S>, kth: Vector<N, S>
     any
 }
 
+/// Where `lhs` is ahead of `rhs` in top-k order by value alone: a NaN is ahead of every
+/// number, as in `torch.topk`, then the larger number. Two NaNs, and equal numbers, are
+/// [`topk_same`].
+#[cube]
+pub(crate) fn topk_ahead<N: Numeric, S: Size>(
+    lhs: Vector<N, S>,
+    rhs: Vector<N, S>,
+) -> Vector<bool, S> {
+    let by_order = lhs.greater_than(&rhs);
+    let elem_type = elem_type_of::<N>();
+    if comptime!(elem_type.is_float()) {
+        let lhs_nan = numeric_is_nan(lhs);
+        let rhs_nan = numeric_is_nan(rhs);
+        by_order.or(lhs_nan.vec_and(!rhs_nan))
+    } else {
+        by_order
+    }
+}
+
+/// Where `lhs` and `rhs` tie by value in top-k order: equal, or both NaN.
+#[cube]
+pub(crate) fn topk_same<N: Numeric, S: Size>(
+    lhs: Vector<N, S>,
+    rhs: Vector<N, S>,
+) -> Vector<bool, S> {
+    let equal = lhs.equal(&rhs);
+    let elem_type = elem_type_of::<N>();
+    if comptime!(elem_type.is_float()) {
+        equal.or(numeric_is_nan(lhs).vec_and(numeric_is_nan(rhs)))
+    } else {
+        equal
+    }
+}
+
+/// Where the slot holding `kept` at `kept_coord` stays ahead of `candidate` at `coord`:
+/// ahead by value, or tied by value at a lower coordinate.
+#[cube]
+pub(crate) fn topk_keeps<N: Numeric, S: Size>(
+    kept: Vector<N, S>,
+    kept_coord: Vector<u32, S>,
+    candidate: Vector<N, S>,
+    coord: Vector<u32, S>,
+) -> Vector<bool, S> {
+    select_many(
+        topk_same(kept, candidate),
+        kept_coord.less_than(&coord),
+        topk_ahead(kept, candidate),
+    )
+}
+
+/// Whether `value` holds a NaN on any lane; never for an integer `N`.
+#[cube]
+fn any_nan<N: Numeric, S: Size>(value: Vector<N, S>) -> bool {
+    let mut any = false;
+    let elem_type = elem_type_of::<N>();
+    if comptime!(elem_type.is_float()) {
+        let nan = numeric_is_nan(value);
+        #[unroll]
+        for i in 0..value.vector_size().comptime() {
+            if nan.extract(i) {
+                any = true;
+            }
+        }
+    }
+    any
+}
+
+/// `value` walked down the sorted list `elements`, which keeps the `k` best: each slot keeps
+/// the better of what it holds and what comes down, and passes the other on.
+///
+/// A value that is no NaN on any lane, almost every value, walks with the plain compare: it
+/// takes a slot it beats. A NaN slot compares false, so it stays ahead, as the order wants.
+/// A value with a NaN, rare, walks in the full order ([`topk_ahead`]), and that walk stays a
+/// loop: unrolled beside the first, it would double the code of every walk. For a list in
+/// registers (`unrolled`), the loop turns the list instead of picking a slot at run time,
+/// which would move the list to memory for the whole kernel.
+#[cube]
+pub(crate) fn topk_walk_values<N: Numeric, S: Size>(
+    elements: &mut Array<Vector<N, S>>,
+    value: Vector<N, S>,
+    #[comptime] k: usize,
+    #[comptime] unrolled: bool,
+) {
+    let mut value = value;
+    if any_nan(value) {
+        if unrolled {
+            for _step in 0..k {
+                let kept = elements[0];
+                let keep = !topk_ahead(value, kept);
+                let passed = select_many(keep, value, kept);
+                #[unroll]
+                for j in 0..k - 1 {
+                    elements[j] = elements[j + 1];
+                }
+                elements[k - 1] = select_many(keep, kept, value);
+                value = passed;
+            }
+        } else {
+            for j in 0..k {
+                let kept = elements[j];
+                let keep = !topk_ahead(value, kept);
+                elements[j] = select_many(keep, kept, value);
+                value = select_many(keep, value, kept);
+            }
+        }
+    } else {
+        #[unroll(unrolled)]
+        for j in 0..k {
+            let kept = elements[j];
+            let takes = kept.less_than(&value);
+            elements[j] = select_many(takes, value, kept);
+            value = select_many(takes, kept, value);
+        }
+    }
+}
+
+/// [`topk_walk_values`] with each value's coordinate riding along: a tie by value goes to
+/// the lower coordinate ([`topk_keeps`]).
+#[cube]
+pub(crate) fn topk_walk_with_coords<N: Numeric, S: Size>(
+    elements: &mut Array<Vector<N, S>>,
+    coordinates: &mut Array<Vector<u32, S>>,
+    value: Vector<N, S>,
+    coordinate: Vector<u32, S>,
+    #[comptime] k: usize,
+    #[comptime] unrolled: bool,
+) {
+    let mut value = value;
+    let mut coordinate = coordinate;
+    if any_nan(value) {
+        if unrolled {
+            for _step in 0..k {
+                let kept = elements[0];
+                let kept_coordinate = coordinates[0];
+                let keep = topk_keeps(kept, kept_coordinate, value, coordinate);
+                let passed = select_many(keep, value, kept);
+                let passed_coordinate = select_many(keep, coordinate, kept_coordinate);
+                #[unroll]
+                for j in 0..k - 1 {
+                    elements[j] = elements[j + 1];
+                    coordinates[j] = coordinates[j + 1];
+                }
+                elements[k - 1] = select_many(keep, kept, value);
+                coordinates[k - 1] = select_many(keep, kept_coordinate, coordinate);
+                value = passed;
+                coordinate = passed_coordinate;
+            }
+        } else {
+            for j in 0..k {
+                let kept = elements[j];
+                let kept_coordinate = coordinates[j];
+                let keep = topk_keeps(kept, kept_coordinate, value, coordinate);
+                elements[j] = select_many(keep, kept, value);
+                coordinates[j] = select_many(keep, kept_coordinate, coordinate);
+                value = select_many(keep, value, kept);
+                coordinate = select_many(keep, coordinate, kept_coordinate);
+            }
+        }
+    } else {
+        #[unroll(unrolled)]
+        for j in 0..k {
+            let kept = elements[j];
+            let kept_coordinate = coordinates[j];
+            let takes = select_many(
+                kept.equal(&value),
+                coordinate.less_than(&kept_coordinate),
+                kept.less_than(&value),
+            );
+            elements[j] = select_many(takes, value, kept);
+            coordinates[j] = select_many(takes, coordinate, kept_coordinate);
+            value = select_many(takes, kept, value);
+            coordinate = select_many(takes, kept_coordinate, coordinate);
+        }
+    }
+}
+
+/// The plane's best `item` per lane in top-k order: a NaN where any unit holds one, the
+/// largest number otherwise. `plane_max` alone drops a NaN on most targets.
+#[cube]
+fn plane_max_nan_first<N: Numeric, S: Size>(item: Vector<N, S>) -> Vector<N, S> {
+    let max = plane_max(item);
+    let elem_type = elem_type_of::<N>();
+    if comptime!(elem_type.is_float()) {
+        let any_nan = plane_max(Vector::<u32, S>::cast_from(numeric_is_nan(item)));
+        select_many(
+            any_nan.equal(&Vector::new(1u32)),
+            Vector::new(nan_value::<N>()),
+            max,
+        )
+    } else {
+        max
+    }
+}
+
+/// The lowest coordinate, per lane, among the plane's units whose `item` ties `target` in
+/// top-k order ([`topk_same`]).
+#[cube]
+fn lowest_coordinate_tying<N: Numeric, S: Size>(
+    target: Vector<N, S>,
+    item: Vector<N, S>,
+    coordinate: Vector<u32, S>,
+) -> Vector<u32, S> {
+    let candidate = select_many(
+        topk_same(item, target),
+        coordinate,
+        Vector::empty().fill(u32::MAX),
+    );
+    plane_min(candidate)
+}
+
 /// Plane-cooperative top-k insertion; the candidate's coordinate decides which
 /// algorithm runs, since winners are identified by their coordinate when one
 /// rides along and by unit id otherwise.
@@ -238,34 +448,21 @@ fn plane_topk_insert_with_coords<N: Numeric, S: Size>(
 
     #[unroll(k * k <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
     for _i in 0..k {
-        let winning_val = plane_max(local_best_val);
-        let winning_coord =
-            lowest_coordinate_matching(winning_val, local_best_val, local_best_coord);
+        let winning_val = plane_max_nan_first(local_best_val);
+        let winning_coord = lowest_coordinate_tying(winning_val, local_best_val, local_best_coord);
 
-        let mut insert_val = winning_val;
-        let mut insert_coord = winning_coord;
-
-        #[unroll(k * k <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
-        for j in 0..k {
-            let to_keep = select_many(
-                elements[j].equal(&insert_val),
-                coordinates[j].less_than(&insert_coord),
-                elements[j].greater_than(&insert_val),
-            );
-
-            let next_val = select_many(to_keep, insert_val, elements[j]);
-            elements[j] = select_many(to_keep, elements[j], insert_val);
-            insert_val = next_val;
-
-            let next_coord = select_many(to_keep, insert_coord, coordinates[j]);
-            coordinates[j] = select_many(to_keep, coordinates[j], insert_coord);
-            insert_coord = next_coord;
-        }
+        topk_walk_with_coords(
+            elements,
+            coordinates,
+            winning_val,
+            winning_coord,
+            k,
+            comptime!(k * k <= crate::components::instructions::TOPK_UNROLL_BUDGET),
+        );
 
         // Winner masking logic
-        let is_winner = local_best_val
-            .equal(&winning_val)
-            .vec_and(local_best_coord.equal(&winning_coord));
+        let is_winner =
+            topk_same(local_best_val, winning_val).vec_and(local_best_coord.equal(&winning_coord));
         local_best_val = select_many(is_winner, Vector::new(max_identity::<N>()), local_best_val);
         local_best_coord = select_many(is_winner, Vector::new(u32::MAX), local_best_coord);
     }
@@ -282,19 +479,16 @@ fn plane_topk_insert_values<N: Numeric, S: Size>(
 
     #[unroll(k * k <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
     for _i in 0..k {
-        let winning_val = plane_max(local_best_val);
-        let is_match = local_best_val.equal(&winning_val);
+        let winning_val = plane_max_nan_first(local_best_val);
+        let is_match = topk_same(local_best_val, winning_val);
         let winning_unit = plane_min(select_many(is_match, unit_id, Vector::new(u32::MAX)));
 
-        let mut insert_val = winning_val;
-
-        #[unroll(k * k <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
-        for j in 0..k {
-            let to_keep = elements[j].greater_than(&insert_val);
-            let next_val = select_many(to_keep, insert_val, elements[j]);
-            elements[j] = select_many(to_keep, elements[j], insert_val);
-            insert_val = next_val;
-        }
+        topk_walk_values(
+            elements,
+            winning_val,
+            k,
+            comptime!(k * k <= crate::components::instructions::TOPK_UNROLL_BUDGET),
+        );
 
         // Winner masking logic
         let is_winner = unit_id.equal(&winning_unit);
@@ -340,12 +534,10 @@ fn plane_topk_merge_with_coords<N: Numeric, S: Size>(
             local_coord = select_many(is_pointed, coordinates[j], local_coord);
         }
 
-        let winning_val = plane_max(local_val);
-        let best_c = lowest_coordinate_matching(winning_val, local_val, local_coord);
+        let winning_val = plane_max_nan_first(local_val);
+        let best_c = lowest_coordinate_tying(winning_val, local_val, local_coord);
         final_coords[i] = best_c;
-        let is_cand = local_val
-            .equal(&winning_val)
-            .vec_and(local_coord.equal(&best_c));
+        let is_cand = topk_same(local_val, winning_val).vec_and(local_coord.equal(&best_c));
         let winning_unit = plane_min(select_many(is_cand, unit_id, Vector::new(u32::MAX)));
 
         final_elements[i] = winning_val;
@@ -379,8 +571,8 @@ fn plane_topk_merge_values<N: Numeric, S: Size>(
             local_val = select_many(is_pointed, elements[j], local_val);
         }
 
-        let winning_val = plane_max(local_val);
-        let is_cand = local_val.equal(&winning_val);
+        let winning_val = plane_max_nan_first(local_val);
+        let is_cand = topk_same(local_val, winning_val);
         let winning_unit = plane_min(select_many(is_cand, unit_id, Vector::new(u32::MAX)));
 
         final_elements[i] = winning_val;

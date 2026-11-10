@@ -10,6 +10,7 @@ use crate::components::instructions::plane_topk_insert;
 use crate::components::instructions::plane_topk_merge;
 use crate::components::instructions::reaches;
 use crate::components::instructions::{Accumulator, Item, Value, ValueExpand};
+use crate::components::instructions::{numeric_is_nan, topk_walk_values, topk_walk_with_coords};
 use crate::{
     ReduceFamily, ReduceInstruction, ReducePrecision,
     components::instructions::{
@@ -61,37 +62,16 @@ pub(crate) fn topk_insert<N: Numeric, S: Size>(
     #[comptime] k: usize,
 ) {
     if reaches(insert_val, elements[k - 1]) {
-        let mut insert_val = insert_val;
-
         match insert_coord {
-            Value::None => {
-                for j in 0..k {
-                    let to_keep = elements[j].greater_than(&insert_val);
-                    let next_val = select_many(to_keep, insert_val, elements[j]);
-                    elements[j] = select_many(to_keep, elements[j], insert_val);
-                    insert_val = next_val;
-                }
-            }
-            Value::Single(coord) => {
-                let mut insert_coord = coord.unwrap();
-                let coords = coordinates.multiple_mut();
-
-                for j in 0..k {
-                    let to_keep = select_many(
-                        elements[j].equal(&insert_val),
-                        coords[j].less_than(&insert_coord),
-                        elements[j].greater_than(&insert_val),
-                    );
-
-                    let next_val = select_many(to_keep, insert_val, elements[j]);
-                    elements[j] = select_many(to_keep, elements[j], insert_val);
-                    insert_val = next_val;
-
-                    let next_coord = select_many(to_keep, insert_coord, coords[j]);
-                    coords[j] = select_many(to_keep, coords[j], insert_coord);
-                    insert_coord = next_coord;
-                }
-            }
+            Value::None => topk_walk_values(elements, insert_val, k, false),
+            Value::Single(coord) => topk_walk_with_coords(
+                elements,
+                coordinates.multiple_mut(),
+                insert_val,
+                coord.unwrap(),
+                k,
+                false,
+            ),
             Value::Multiple(_) => panic!("a top-k candidate carries at most one coordinate"),
         }
     }
@@ -363,6 +343,8 @@ fn topk_finalize_values<P: ReducePrecision, Out: Numeric>(
 ) -> Array<Out> {
     let vals = accumulator.elements.multiple();
     let vector_size = vals[0].vector_size().comptime();
+    let unrolled =
+        comptime!(k * k * vector_size <= crate::components::instructions::TOPK_UNROLL_BUDGET);
 
     let mut topk = Array::new(k);
     #[unroll]
@@ -370,19 +352,43 @@ fn topk_finalize_values<P: ReducePrecision, Out: Numeric>(
         topk[slot] = max_identity::<Out>();
     }
 
-    #[unroll(k * k * vector_size <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
+    #[unroll(unrolled)]
     for i in 0..k {
         #[unroll]
         for j in 0..vector_size {
             let mut element = Out::cast_from(vals[i].extract(j));
 
-            #[unroll(k * k * vector_size <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
-            for slot in 0..k {
-                let current = topk[slot];
-                let keep = current > element;
-
-                topk[slot] = select(keep, current, element);
-                element = select(keep, element, current);
+            if scalar_is_nan::<Out>(element) {
+                // Rare, and a loop (see `topk_walk_values`): a NaN passes the NaN slots only.
+                if unrolled {
+                    for _step in 0..k {
+                        let current = topk[0];
+                        let keep = scalar_is_nan::<Out>(current);
+                        let passed = select(keep, element, current);
+                        #[unroll]
+                        for slot in 0..k - 1 {
+                            topk[slot] = topk[slot + 1];
+                        }
+                        topk[k - 1] = select(keep, current, element);
+                        element = passed;
+                    }
+                } else {
+                    for slot in 0..k {
+                        let current = topk[slot];
+                        let keep = scalar_is_nan::<Out>(current);
+                        topk[slot] = select(keep, current, element);
+                        element = select(keep, element, current);
+                    }
+                }
+            } else {
+                // A NaN slot compares false, so it keeps its place ahead.
+                #[unroll(unrolled)]
+                for slot in 0..k {
+                    let current = topk[slot];
+                    let takes = current < element;
+                    topk[slot] = select(takes, element, current);
+                    element = select(takes, current, element);
+                }
             }
         }
     }
@@ -403,6 +409,8 @@ fn topk_finalize_with_coords<P: ReducePrecision>(
     let vals = accumulator.elements.multiple();
     let coords = accumulator.args.multiple();
     let vector_size = coords[0].vector_size().comptime();
+    let unrolled =
+        comptime!(k * k * vector_size <= crate::components::instructions::TOPK_UNROLL_BUDGET);
 
     let mut topk_vals = Array::new(k);
     let mut topk_coords = Array::new(k);
@@ -413,32 +421,76 @@ fn topk_finalize_with_coords<P: ReducePrecision>(
         topk_coords[slot] = u32::MAX;
     }
 
-    #[unroll(k * k * vector_size <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
+    #[unroll(unrolled)]
     for i in 0..k {
         #[unroll]
         for j in 0..vector_size {
             let mut value = vals[i].extract(j);
             let mut coordinate = coords[i].extract(j);
 
-            #[unroll(k * k * vector_size <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
-            for slot in 0..k {
-                let current_value = topk_vals[slot];
-                let current_coordinate = topk_coords[slot];
-
-                let to_keep = select(
-                    current_value == value,
-                    current_coordinate < coordinate,
-                    current_value > value,
-                );
-
-                topk_vals[slot] = select(to_keep, current_value, value);
-                topk_coords[slot] = select(to_keep, current_coordinate, coordinate);
-
-                value = select(to_keep, value, current_value);
-                coordinate = select(to_keep, coordinate, current_coordinate);
+            if scalar_is_nan::<P::EA>(value) {
+                // Rare, and a loop (see `topk_walk_with_coords`): a NaN passes the NaN
+                // slots at a lower coordinate only.
+                if unrolled {
+                    for _step in 0..k {
+                        let current_value = topk_vals[0];
+                        let current_coordinate = topk_coords[0];
+                        let keep = scalar_is_nan::<P::EA>(current_value)
+                            && current_coordinate < coordinate;
+                        let passed_value = select(keep, value, current_value);
+                        let passed_coordinate = select(keep, coordinate, current_coordinate);
+                        #[unroll]
+                        for slot in 0..k - 1 {
+                            topk_vals[slot] = topk_vals[slot + 1];
+                            topk_coords[slot] = topk_coords[slot + 1];
+                        }
+                        topk_vals[k - 1] = select(keep, current_value, value);
+                        topk_coords[k - 1] = select(keep, current_coordinate, coordinate);
+                        value = passed_value;
+                        coordinate = passed_coordinate;
+                    }
+                } else {
+                    for slot in 0..k {
+                        let current_value = topk_vals[slot];
+                        let current_coordinate = topk_coords[slot];
+                        let keep = scalar_is_nan::<P::EA>(current_value)
+                            && current_coordinate < coordinate;
+                        topk_vals[slot] = select(keep, current_value, value);
+                        topk_coords[slot] = select(keep, current_coordinate, coordinate);
+                        value = select(keep, value, current_value);
+                        coordinate = select(keep, coordinate, current_coordinate);
+                    }
+                }
+            } else {
+                // A NaN slot compares false, so it keeps its place ahead.
+                #[unroll(unrolled)]
+                for slot in 0..k {
+                    let current_value = topk_vals[slot];
+                    let current_coordinate = topk_coords[slot];
+                    let takes = select(
+                        current_value == value,
+                        coordinate < current_coordinate,
+                        current_value < value,
+                    );
+                    topk_vals[slot] = select(takes, value, current_value);
+                    topk_coords[slot] = select(takes, coordinate, current_coordinate);
+                    value = select(takes, current_value, value);
+                    coordinate = select(takes, current_coordinate, coordinate);
+                }
             }
         }
     }
 
     (topk_vals, topk_coords)
+}
+
+/// Whether the scalar `value` is a NaN; never for an integer `E`.
+#[cube]
+fn scalar_is_nan<E: Numeric>(value: E) -> bool {
+    let mut nan = false;
+    let elem_type = elem_type_of::<E>();
+    if comptime!(elem_type.is_float()) {
+        nan = numeric_is_nan(Vector::<E, Const<1>>::new(value)).extract(0usize);
+    }
+    nan
 }

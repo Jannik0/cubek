@@ -40,7 +40,8 @@ pub fn reference_topk(
             coord[axis] = i;
             values.push(input.get_f32(&coord));
         }
-        values.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        // NaN first, as `torch.topk` and the kernels' `TopK` order it, then the largest.
+        values.sort_by(|a, b| b.is_nan().cmp(&a.is_nan()).then(b.total_cmp(a)));
 
         for i in 0..k {
             coord[axis] = i;
