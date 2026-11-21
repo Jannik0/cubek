@@ -115,3 +115,21 @@ fn direct_f16_matches_the_reference() {
     let direct = Convolves::new(Direct, Declines::Never);
     direct.check(direct.at(&[Pass::Forward], &Conv::direct_grid(F16)));
 }
+
+/// Half floats sum in `f32`: sixty-fourths over 64 channels and a 3x3 kernel give partial sums
+/// that an `f32` accumulator holds exactly and an `f16` one rounds at nearly every step, which the
+/// tolerance of the output's own rounding does not absorb.
+#[test]
+fn direct_f16_sums_in_f32() {
+    let layers = [1, 4].map(|groups| {
+        Conv::of(F16)
+            .batches(2)
+            .spatial([6, 6])
+            .channels(64)
+            .out_channels(16)
+            .groups(groups)
+            .kernel([3, 3])
+    });
+    let direct = Convolves::new(Direct, Declines::Never);
+    direct.check(direct.at(&[Pass::Forward], &layers));
+}
